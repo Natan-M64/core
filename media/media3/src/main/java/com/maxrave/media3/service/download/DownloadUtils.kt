@@ -199,8 +199,13 @@ internal class DownloadUtils(
             dataSourceFactory,
             Executor(Runnable::run),
         ).apply {
-            maxParallelDownloads = 4
+            maxParallelDownloads = 3
             minRetryCount = 3
+            coroutineScope.launch {
+                dataStoreManager.maxParallelDownloads.collect { count ->
+                    maxParallelDownloads = count.coerceIn(1, 20)
+                }
+            }
             addListener(
                 MusicDownloadService.TerminalStateNotificationHelper(
                     context = context,
