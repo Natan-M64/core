@@ -67,11 +67,15 @@ internal class WaveformReader(
         positionMs: Long,
     ): Float = playbackWaveforms.bassPulse(mediaId.removePrefix(MERGING_DATA_TYPE.VIDEO), positionMs)
 
-    fun playbackSink(delegate: AudioSink, mediaId: String?): AudioSink =
+    fun playbackSink(
+        delegate: AudioSink,
+        mediaId: String?,
+        isCaptureEnabled: () -> Boolean = { true },
+    ): AudioSink =
         if (mediaId.isNullOrBlank()) {
             delegate
         } else {
-            WaveformAudioSink(delegate, mediaId.removePrefix(MERGING_DATA_TYPE.VIDEO), playbackWaveforms)
+            WaveformAudioSink(delegate, mediaId.removePrefix(MERGING_DATA_TYPE.VIDEO), playbackWaveforms, isCaptureEnabled)
         }
 
     /** AutoMix's measurements of the track; null when it has none (yet, or ever). */

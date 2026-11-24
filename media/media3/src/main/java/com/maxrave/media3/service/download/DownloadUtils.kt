@@ -325,6 +325,8 @@ internal class DownloadUtils(
                     songRepository.updateDownloadState(videoId, DownloadState.STATE_NOT_DOWNLOADED)
                 }
                 previousIds = download.keys.toSet()
+                val currentTasks = _downloadTask.value
+                val changedTasks = mutableMapOf<String, Int>()
                 download.forEach {
                     val videoId = it.key
                     val audio = it.value.first?.state
@@ -349,11 +351,8 @@ internal class DownloadUtils(
                                 else -> DownloadState.STATE_DOWNLOADING
                             }
                         }
-                    _downloadTask.update {
-                        it.toMutableMap().apply {
-                            set(videoId, combineState)
-                        }
-                    }
+                    if (currentTasks[videoId] == combineState) return@forEach
+                    changedTasks[videoId] = combineState
                     when (combineState) {
                         DownloadState.STATE_DOWNLOADED -> {
                             downloadingVideoIds.update {
@@ -383,6 +382,9 @@ internal class DownloadUtils(
                             songRepository.updateDownloadState(videoId, DownloadState.STATE_PREPARING)
                         }
                     }
+                }
+                if (changedTasks.isNotEmpty()) {
+                    _downloadTask.update { it + changedTasks }
                 }
             }
         }

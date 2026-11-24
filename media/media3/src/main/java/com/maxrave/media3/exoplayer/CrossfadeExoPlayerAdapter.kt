@@ -149,6 +149,13 @@ internal class CrossfadeExoPlayerAdapter(
                 Logger.d(TAG, "Skip crossfade inside album: $skipCrossfadeInAlbum")
             }
         }
+        coroutineScope.launch {
+            dataStoreManager.nowPlayingStyle.collect { style ->
+                waveformCaptureEnabled =
+                    style == DataStoreManager.NOW_PLAYING_STYLE_SOUNDCLOUD ||
+                    style == DataStoreManager.NOW_PLAYING_STYLE_APPLE_MUSIC
+            }
+        }
     }
 
     // ========== State Management ==========
@@ -389,6 +396,9 @@ internal class CrossfadeExoPlayerAdapter(
     /** User setting: leave transitions inside an album alone. */
     @Volatile
     private var skipCrossfadeInAlbum = false
+
+    @Volatile
+    private var waveformCaptureEnabled = false
 
     /** Set by the handler when an album is loaded; empty for every other kind of queue. */
     @Volatile
@@ -649,7 +659,7 @@ internal class CrossfadeExoPlayerAdapter(
 
                                 override fun getAudioProcessors(): Array<AudioProcessor> = processorsWithEightD
                             },
-                        ).build().let { waveformReader.playbackSink(it, mediaId) }
+                        ).build().let { waveformReader.playbackSink(it, mediaId) { waveformCaptureEnabled } }
             }
 
         val player =
