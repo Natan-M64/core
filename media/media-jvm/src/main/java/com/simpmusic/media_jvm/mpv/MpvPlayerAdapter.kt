@@ -57,6 +57,7 @@ import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.roundToInt
 import kotlin.random.Random
+import kotlin.time.TimeSource
 
 private const val TAG = "MpvPlayerAdapter"
 
@@ -2438,10 +2439,17 @@ class MpvPlayerAdapter(
         var lastOutgoingPitch = -1f
 
         try {
+            // Each step waits for its own mark from the fade's start, not a fixed delay after the previous
+            // step's work, so the time spent retuning the players never adds up and the fade ends at
+            // effectiveDurationMs, where the plan lands the incoming drop. Waiting a full step after every
+            // step (the last one included) ran a 22.4 s fade about 1.4 s long.
+            val fadeStart = TimeSource.Monotonic.markNow()
             for (step in 0..steps) {
                 currentCoroutineContext().ensureActive()
+                val wait = effectiveDurationMs.toLong() * step / steps - fadeStart.elapsedNow().inWholeMilliseconds
+                if (wait > 0) delay(wait)
 
-                val progress = step.toFloat() / steps
+                val progress = (fadeStart.elapsedNow().inWholeMilliseconds.toFloat() / effectiveDurationMs).coerceIn(0f, 1f)
                 val angle = progress * Math.PI / 2.0
 
                 val fadeOutVolume = (targetVolume * kotlin.math.cos(angle)).toInt()
@@ -2494,8 +2502,6 @@ class MpvPlayerAdapter(
                         lastOutgoingPitch = qOutPitch
                     }
                 }
-
-                delay(delayPerStep.toLong())
             }
 
             finalizeCrossfade(nextIndex, nextPlayer)
@@ -2660,12 +2666,20 @@ class MpvPlayerAdapter(
         return 30000.0 - (clampedBpm - 70) * 230.0
     }
 
+    /**
+     * The BPM a fade's length is worked out from: Tidal's, else the one measured from the waveform. The
+     * measured one sets only the length (7 of 177 tracks measured off by far more than a rounding), never the
+     * tempo match, which stays on Tidal's alone in [calculateBpmSpeedRatio].
+     */
+    private fun bpmForFadeLength(videoId: String): Int? =
+        audioMetaCache[videoId]?.bpm ?: trackStructures[videoId]?.bpm?.roundToInt()
+
     private fun resolveAutoCrossfadeDurationMs(
         currentVideoId: String,
         nextVideoId: String,
     ): Int {
-        val currentBpm = audioMetaCache[currentVideoId]?.bpm
-        val nextBpm = audioMetaCache[nextVideoId]?.bpm
+        val currentBpm = bpmForFadeLength(currentVideoId)
+        val nextBpm = bpmForFadeLength(nextVideoId)
         if (currentBpm == null || nextBpm == null) return AUTO_FALLBACK_DURATION_MS
         if (currentBpm <= 0 || nextBpm <= 0) return AUTO_FALLBACK_DURATION_MS
 
@@ -2776,10 +2790,10 @@ class MpvPlayerAdapter(
         /** Floor for the shortest track worth crossfading, in ms. */
         private const val MIN_CROSSFADE_TRACK_MS = 20_000L
 
-        private const val AUTO_FALLBACK_DURATION_MS = 30000
+        private const val AUTO_FALLBACK_DURATION_MS = 24000
         private const val STRUCTURE_RETRY_MS = 30_000L
         private const val STRUCTURE_MAX_ATTEMPTS = 3
-        private const val AUTO_MIN_DURATION_MS = 20000
+        private const val AUTO_MIN_DURATION_MS = 15000
         private const val AUTO_MAX_DURATION_MS = 45000
         private val BEAT_COUNT_OPTIONS = intArrayOf(8, 16, 24, 32, 40, 48, 64, 80, 96)
         private const val DEFAULT_BEAT_COUNT = 32

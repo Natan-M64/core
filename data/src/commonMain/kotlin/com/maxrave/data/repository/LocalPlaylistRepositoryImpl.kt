@@ -157,15 +157,21 @@ internal class LocalPlaylistRepositoryImpl(
         }
     }
 
-    override suspend fun getFullPlaylistTracks(id: Long): List<SongEntity> {
+    override suspend fun getFullPlaylistTracks(
+        id: Long,
+        filterState: FilterState,
+    ): List<SongEntity> {
         if (localDataSource.getLocalPlaylist(id) == null) return emptyList()
+        // Older first and newer first are position ASC and DESC (their time only cuts the screen's
+        // pages), so both read the custom order, newer first reversed; title pages by title.
+        val pagedBy = if (filterState == FilterState.Title) FilterState.Title else FilterState.CustomOrder
         val tracks = mutableListOf<SongEntity>()
         var currentPage = 0
         while (true) {
             val pairs =
                 localDataSource.getPlaylistPairSongByOffset(
                     playlistId = id,
-                    filterState = FilterState.CustomOrder,
+                    filterState = pagedBy,
                     offset = currentPage,
                 )
             if (pairs.isNullOrEmpty()) {
@@ -184,12 +190,7 @@ internal class LocalPlaylistRepositoryImpl(
             tracks.addAll(sorted)
             currentPage++
         }
-        return tracks
-    }
-
-    override suspend fun getListTrackVideoId(id: Long): List<String> {
-        val playlist = localDataSource.getLocalPlaylist(id)
-        return playlist?.tracks ?: emptyList()
+        return if (filterState == FilterState.NewerFirst) tracks.reversed() else tracks
     }
 
     override fun insertLocalPlaylist(
@@ -621,6 +622,7 @@ internal class LocalPlaylistRepositoryImpl(
     override fun removeTrackFromLocalPlaylist(
         id: Long,
         song: SongEntity,
+        pairId: Int,
         successMessage: String,
         updatedYtMessage: String,
         errorMessage: String,
@@ -628,35 +630,94 @@ internal class LocalPlaylistRepositoryImpl(
         flow {
             emit(LocalResource.Loading())
             val localPlaylist = localDataSource.getLocalPlaylist(id) ?: return@flow
-            val nextTracks = localPlaylist.tracks?.toMutableList() ?: mutableListOf()
-            nextTracks.remove(song.videoId)
-            localDataSource.updateLocalPlaylistTracks(nextTracks, id)
-            localDataSource.deletePairSongLocalPlaylist(id, song.videoId)
-            emit(LocalResource.Success(successMessage))
             val ytPlaylistId = localPlaylist.youtubePlaylistId
-            if (ytPlaylistId != null) {
-                val entry = findSetVideoId(song.videoId, ytPlaylistId)
-                val setVideoId = entry?.setVideoId
-                if (entry != null && setVideoId != null) {
-                    youTube
-                        .removeItemYouTubePlaylist(ytPlaylistId, song.videoId, setVideoId)
-                        .onSuccess {
-                            // Nothing else ever deletes from set_video_id: a row left behind for an
-                            // entry YouTube no longer has would be sent again on the next lookup.
-                            // A legacy "" row is kept, since it may hold another playlist's entry
-                            // that the other playlist still falls back to.
-                            if (entry.youtubePlaylistId.isNotEmpty()) {
-                                localDataSource.deleteSetVideoId(entry.videoId, entry.youtubePlaylistId)
-                            }
-                            emit(LocalResource.Success(successMessage))
-                        }.onFailure {
-                            emit(LocalResource.Error<String>("$errorMessage: ${it.message}"))
-                        }
+            // Which copy of the song this row is, in playlist order, taken before the row goes. Only
+            // needed with copies: YouTube keeps one entry per copy, but set_video_id keeps one
+            // setVideoId per song, so the entry has to be picked by this rank instead.
+            val copyRank =
+                if (ytPlaylistId != null) {
+                    localDataSource
+                        .getAllPlaylistPairSongByPosition(id)
+                        .filter { it.songId == song.videoId }
+                        .sortedWith(compareBy({ it.position }, { it.id }))
+                        .takeIf { it.size > 1 }
+                        ?.indexOfFirst { it.id == pairId }
+                        ?.takeIf { it >= 0 }
                 } else {
-                    emit(LocalResource.Error<String>("$errorMessage: SetVideoId is null"))
+                    null
                 }
+            // Only the picked row goes: removing by videoId dropped every copy from the list while
+            // `tracks` kept one, so the song vanished yet could not be added again (#2933).
+            if (!localDataSource.removePairSongFromLocalPlaylist(id, song.videoId, pairId)) {
+                emit(LocalResource.Error<String>("$errorMessage: row $pairId is already gone"))
+                return@flow
+            }
+            emit(LocalResource.Success(successMessage))
+            if (ytPlaylistId == null) return@flow
+            if (copyRank != null) {
+                removeCopyFromYouTube(ytPlaylistId, song.videoId, copyRank)
+                    .onSuccess { emit(LocalResource.Success(successMessage)) }
+                    .onFailure { emit(LocalResource.Error<String>("$errorMessage: ${it.message}")) }
+                return@flow
+            }
+            val entry = findSetVideoId(song.videoId, ytPlaylistId)
+            val setVideoId = entry?.setVideoId
+            if (entry != null && setVideoId != null) {
+                youTube
+                    .removeItemYouTubePlaylist(ytPlaylistId, song.videoId, setVideoId)
+                    .onSuccess {
+                        // Nothing else ever deletes from set_video_id: a row left behind for an
+                        // entry YouTube no longer has would be sent again on the next lookup.
+                        // A legacy "" row is kept, since it may hold another playlist's entry
+                        // that the other playlist still falls back to.
+                        if (entry.youtubePlaylistId.isNotEmpty()) {
+                            localDataSource.deleteSetVideoId(entry.videoId, entry.youtubePlaylistId)
+                        }
+                        emit(LocalResource.Success(successMessage))
+                    }.onFailure {
+                        emit(LocalResource.Error<String>("$errorMessage: ${it.message}"))
+                    }
+            } else {
+                emit(LocalResource.Error<String>("$errorMessage: SetVideoId is null"))
             }
         }.flowOn(Dispatchers.IO)
+
+    /**
+     * Removes the [rank]-th copy (0-based, playlist order) of [videoId] from the YouTube playlist.
+     * Every copy has its own setVideoId but set_video_id stores one per song (the last one written),
+     * so the copies are read from YouTube itself, in YouTube's order, which local order follows: an
+     * import lays rows out in that order and moves in a linked playlist are sent to YouTube. The
+     * stored row then points at a copy still there, so the next removal finds it; it goes with the
+     * last copy.
+     */
+    private suspend fun removeCopyFromYouTube(
+        ytPlaylistId: String,
+        videoId: String,
+        rank: Int,
+    ): Result<Unit> =
+        runCatching {
+            val copies =
+                youTube
+                    .getYouTubePlaylistFullTracksWithSetVideoId(ytPlaylistId)
+                    .getOrThrow()
+                    .filter { it.first.id == videoId }
+                    .map { it.second }
+            val target = copies.getOrNull(rank) ?: copies.lastOrNull() ?: error("not in the YouTube playlist")
+            youTube.removeItemYouTubePlaylist(ytPlaylistId, videoId, target).getOrThrow()
+            val stored = findSetVideoId(videoId, ytPlaylistId)
+            val left = copies.toMutableList().apply { remove(target) }
+            if (left.isNotEmpty()) {
+                localDataSource.insertSetVideoId(
+                    SetVideoIdEntity(
+                        videoId = videoId,
+                        setVideoId = left.first(),
+                        youtubePlaylistId = stored?.youtubePlaylistId?.takeIf { it.isNotEmpty() } ?: ytPlaylistId.removePrefix("VL"),
+                    ),
+                )
+            } else if (stored != null && stored.youtubePlaylistId.isNotEmpty()) {
+                localDataSource.deleteSetVideoId(videoId, stored.youtubePlaylistId)
+            }
+        }
 
     /**
      * The stored entry of [videoId] in the YouTube playlist [youtubePlaylistId], matched with and
@@ -869,13 +930,19 @@ internal class LocalPlaylistRepositoryImpl(
             localDataSource.insertPairSongLocalPlaylist(pairSongLocalPlaylist)
         }
 
-    override fun getPlaylistPairSongByListPosition(
+    override fun getPlaylistPairSongByRowIds(
         playlistId: Long,
-        listPosition: List<Int>,
+        rowIds: List<Int>,
     ): Flow<List<PairSongLocalPlaylist>?> =
         flow {
-            emit(localDataSource.getPlaylistPairSongByListPosition(playlistId, listPosition))
+            // SQL hands the rows back in table order, which is how a shuffle used to come out as
+            // one random song and then the playlist from the top (#2520).
+            val rank = rowIds.withIndex().associate { (index, id) -> id to index }
+            emit(localDataSource.getPlaylistPairSongByRowIds(playlistId, rowIds).sortedBy { rank[it.id] })
         }.flowOn(Dispatchers.IO)
+
+    override suspend fun getPlaylistRows(playlistId: Long): List<PairSongLocalPlaylist> =
+        withContext(Dispatchers.IO) { localDataSource.getAllPlaylistPairSongByPosition(playlistId) }
 
     override fun getPlaylistPairSongByOffset(
         playlistId: Long,

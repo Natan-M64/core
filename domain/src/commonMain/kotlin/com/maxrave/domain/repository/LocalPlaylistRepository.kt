@@ -34,10 +34,14 @@ interface LocalPlaylistRepository {
 
     suspend fun insertPairSongLocalPlaylist(pairSongLocalPlaylist: PairSongLocalPlaylist)
 
-    fun getPlaylistPairSongByListPosition(
+    /** The rows [rowIds] of the playlist, in the order of [rowIds] (a shuffled order stays shuffled). */
+    fun getPlaylistPairSongByRowIds(
         playlistId: Long,
-        listPosition: List<Int>,
+        rowIds: List<Int>,
     ): Flow<List<PairSongLocalPlaylist>?>
+
+    /** Every row of the playlist, one per copy of a song, in playlist order. */
+    suspend fun getPlaylistRows(playlistId: Long): List<PairSongLocalPlaylist>
 
     fun getPlaylistPairSongByOffset(
         playlistId: Long,
@@ -114,9 +118,11 @@ interface LocalPlaylistRepository {
         filter: FilterState,
     ): Flow<PagingData<Pair<SongEntity, PairSongLocalPlaylist>>>
 
-    suspend fun getFullPlaylistTracks(id: Long): List<SongEntity>
-
-    suspend fun getListTrackVideoId(id: Long): List<String>
+    /** Every song of the playlist in [filterState]'s order, the order the playlist screen lists and plays it in. */
+    suspend fun getFullPlaylistTracks(
+        id: Long,
+        filterState: FilterState = FilterState.CustomOrder,
+    ): List<SongEntity>
 
     fun insertLocalPlaylist(
         localPlaylist: LocalPlaylistEntity,
@@ -188,9 +194,11 @@ interface LocalPlaylistRepository {
         errorMessage: String,
     ): Flow<LocalResource<String>>
 
+    /** Removes the playlist row [pairId] of [song], exactly the copy the user picked. */
     fun removeTrackFromLocalPlaylist(
         id: Long,
         song: SongEntity,
+        pairId: Int,
         successMessage: String,
         updatedYtMessage: String,
         errorMessage: String,

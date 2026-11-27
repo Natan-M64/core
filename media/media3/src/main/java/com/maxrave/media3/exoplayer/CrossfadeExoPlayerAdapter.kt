@@ -71,8 +71,10 @@ import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.ln
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.random.Random
+import kotlin.time.TimeSource
 
 private const val TAG = "CrossfadeExoPlayerAdapter"
 
@@ -261,6 +263,7 @@ internal class CrossfadeExoPlayerAdapter(
         AudioManager.OnAudioFocusChangeListener { focusChange ->
             when (focusChange) {
                 AudioManager.AUDIOFOCUS_GAIN -> {
+                    hasAudioFocus = true
                     // Don't fight the crossfade ramp; while crossfading it owns the volume.
                     if (!isCrossfading) currentPlayer?.volume = internalVolume
                     if (resumeOnFocusGain) {
@@ -277,7 +280,9 @@ internal class CrossfadeExoPlayerAdapter(
                 }
 
                 AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                    // Temporary loss (e.g. an incoming call): pause and remember to resume.
+                    // Temporary loss (e.g. an incoming call): pause and remember to resume. Focus is
+                    // not held until it comes back, so a play meanwhile asks for it again (#2207).
+                    hasAudioFocus = false
                     resumeOnFocusGain = internalState == InternalState.PLAYING
                     pause()
                 }
@@ -304,19 +309,81 @@ internal class CrossfadeExoPlayerAdapter(
             .build()
     }
 
-    /** Request app-level audio focus once; idempotent while focus is held. */
+    /**
+     * Requests app-level audio focus unless it is held. [hasAudioFocus] follows the focus changes:
+     * a transient loss clears it (it used to stay set, so a play during the loss, such as Android
+     * Auto resuming as the car connects, started without focus and the car showed playing over
+     * silence, #2207), and regaining focus sets it again. While ducked under a navigation prompt
+     * focus is still held, and asking again would take it from the navigation app and cut the
+     * prompt off, so nothing is asked then.
+     */
     private fun requestAudioFocusInternal(): Boolean {
         val am = audioManager ?: return true
         if (hasAudioFocus) return true
         val granted = am.requestAudioFocus(audioFocusRequest) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
         hasAudioFocus = granted
+        // Holding focus again by request rather than by a GAIN (Play pressed during a transient loss:
+        // the transient owner is the one that loses it, so no GAIN follows) ends the wait to resume,
+        // or a later GAIN after ducking would restart playback the user had paused since.
+        if (granted) resumeOnFocusGain = false
         Logger.d(TAG, "requestAudioFocus -> granted=$granted")
         return granted
     }
 
+    /**
+     * A phone or VoIP call is ringing, screened, redirected or in progress: the one case a refused
+     * focus keeps music paused. The screening and redirect modes are plain ints that older releases
+     * never report, so comparing against them is safe on every API level.
+     */
+    @SuppressLint("InlinedApi")
+    private fun isInCall(): Boolean =
+        when (audioManager?.mode) {
+            AudioManager.MODE_IN_CALL,
+            AudioManager.MODE_IN_COMMUNICATION,
+            AudioManager.MODE_RINGTONE,
+            AudioManager.MODE_CALL_SCREENING,
+            AudioManager.MODE_CALL_REDIRECT,
+            AudioManager.MODE_COMMUNICATION_REDIRECT,
+            -> true
+
+            else -> false
+        }
+
+    private var focusRetryJob: Job? = null
+
+    /**
+     * A start that went ahead without focus (refused outside a call: on Android 15 the app is not yet
+     * a foreground service at that moment) asks again once playback has brought the service up, so it
+     * is not left playing without focus: the car may show playing over silence (#2207), and the next
+     * track change would ask while a navigation prompt holds focus and cut the prompt off.
+     */
+    private fun retryAudioFocusWhilePlaying() {
+        if (hasAudioFocus) return
+        focusRetryJob?.cancel()
+        focusRetryJob =
+            coroutineScope.launch {
+                repeat(FOCUS_RETRY_ATTEMPTS) {
+                    delay(FOCUS_RETRY_DELAY_MS)
+                    if (internalState != InternalState.PLAYING || hasAudioFocus) return@launch
+                    // Playing without focus, the app hears no LOSS_TRANSIENT when a call rings: pause
+                    // here. Unlike a held focus, no GAIN follows the call, so playback stays paused.
+                    if (isInCall()) {
+                        Logger.w(TAG, "Focus retry: a call started while playing without focus, pausing")
+                        pause()
+                        return@launch
+                    }
+                    if (requestAudioFocusInternal()) return@launch
+                }
+            }
+    }
+
+    /**
+     * Always abandons, whatever [hasAudioFocus] says: after a transient loss, or a request refused
+     * during a call, the app is still in the focus stack, and skipping this left it there with
+     * [resumeOnFocusGain] set, so the call ending started playback the user had stopped.
+     */
     private fun abandonAudioFocusInternal() {
         val am = audioManager ?: return
-        if (!hasAudioFocus) return
         am.abandonAudioFocusRequest(audioFocusRequest)
         hasAudioFocus = false
         resumeOnFocusGain = false
@@ -716,7 +783,13 @@ internal class CrossfadeExoPlayerAdapter(
             when (internalState) {
                 InternalState.READY, InternalState.ENDED, InternalState.PAUSED -> {
                     currentPlayer?.let { player ->
-                        requestAudioFocusInternal()
+                        // Stay paused during a call. Other refusals still play, as before: Android 15
+                        // refuses focus to an app that is neither on top nor in a foreground service,
+                        // which is exactly a Play pressed in the car or on a headset after a long pause.
+                        if (!requestAudioFocusInternal() && isInCall()) {
+                            Logger.w(TAG, "Play: refused audio focus during a call, staying paused")
+                            return@launch
+                        }
                         // At the end of the queue `play()` only sets playWhenReady, which does
                         // nothing while the player sits in STATE_ENDED — the press would look
                         // ignored. Rewind first so the last track replays.
@@ -727,6 +800,7 @@ internal class CrossfadeExoPlayerAdapter(
                         player.play()
                         transitionToState(InternalState.PLAYING)
                         internalPlayWhenReady = true
+                        retryAudioFocusWhilePlaying()
                     } ?: Logger.w(TAG, "Play called but currentPlayer is null")
                 }
 
@@ -1836,12 +1910,17 @@ internal class CrossfadeExoPlayerAdapter(
                         cachedPosition = startPositionMs
                     }
 
-                    // Auto-play if requested
-                    if (shouldPlay) {
-                        requestAudioFocusInternal()
+                    // Auto-play if requested; during a call (focus refused) the track loads paused
+                    val blockedByCall = shouldPlay && !requestAudioFocusInternal() && isInCall()
+                    if (shouldPlay && !blockedByCall) {
                         player.play()
                         transitionToState(InternalState.PLAYING)
+                        retryAudioFocusWhilePlaying()
                     } else {
+                        if (blockedByCall) {
+                            Logger.w(TAG, "Auto-play: refused audio focus during a call, loaded paused")
+                            internalPlayWhenReady = false
+                        }
                         player.pause()
                         transitionToState(InternalState.READY)
                     }
@@ -2520,10 +2599,17 @@ internal class CrossfadeExoPlayerAdapter(
         crossfadeJob =
             coroutineScope.launch {
                 try {
+                    // Each step waits for its own mark from the fade's start, not a fixed delay after the previous
+                    // step's work, so the time spent retuning the players never adds up and the fade ends at
+                    // effectiveDurationMs, where the plan lands the incoming drop. Waiting a full step after every
+                    // step (the last one included) ran a 22.4 s fade about 1.4 s long.
+                    val fadeStart = TimeSource.Monotonic.markNow()
                     for (step in 0..steps) {
                         if (!isActive) break
+                        val wait = effectiveDurationMs.toLong() * step / steps - fadeStart.elapsedNow().inWholeMilliseconds
+                        if (wait > 0) delay(wait)
 
-                        val progress = step.toFloat() / steps
+                        val progress = (fadeStart.elapsedNow().inWholeMilliseconds.toFloat() / effectiveDurationMs).coerceIn(0f, 1f)
 
                         // Equal-power crossfade (cos/sin curves) instead of linear.
                         // Human loudness perception is logarithmic — linear volume fade makes
@@ -2592,8 +2678,6 @@ internal class CrossfadeExoPlayerAdapter(
                                 lastOutgoingPitch = qOutPitch
                             }
                         }
-
-                        delay(delayPerStep.toLong())
                     }
 
                     // Transition complete
@@ -2764,12 +2848,20 @@ internal class CrossfadeExoPlayerAdapter(
      * 3. Key gap factor: larger Camelot distance → longer crossfade to mask harmonic clash
      * 4. Quantize to beat boundaries, clamp to safe range
      */
+    /**
+     * The BPM a fade's length is worked out from: Tidal's, else the one measured from the waveform. The
+     * measured one sets only the length (7 of 177 tracks measured off by far more than a rounding), never the
+     * tempo match, which stays on Tidal's alone in [calculateBpmSpeedRatio].
+     */
+    private fun bpmForFadeLength(videoId: String): Int? =
+        audioMetaCache[videoId]?.bpm ?: trackStructures[videoId]?.bpm?.roundToInt()
+
     private fun resolveAutoCrossfadeDurationMs(
         currentVideoId: String,
         nextVideoId: String,
     ): Int {
-        val currentBpm = audioMetaCache[currentVideoId]?.bpm
-        val nextBpm = audioMetaCache[nextVideoId]?.bpm
+        val currentBpm = bpmForFadeLength(currentVideoId)
+        val nextBpm = bpmForFadeLength(nextVideoId)
         if (currentBpm == null || nextBpm == null) return AUTO_FALLBACK_DURATION_MS
         if (currentBpm <= 0 || nextBpm <= 0) return AUTO_FALLBACK_DURATION_MS
 
@@ -3061,6 +3153,10 @@ internal class CrossfadeExoPlayerAdapter(
     }
 
     companion object {
+        /** How often, and how long apart, a start without focus asks for it again. */
+        private const val FOCUS_RETRY_ATTEMPTS = 5
+        private const val FOCUS_RETRY_DELAY_MS = 1_000L
+
         /** Floor for the shortest track worth crossfading, in ms. */
         private const val MIN_CROSSFADE_TRACK_MS = 20_000L
 
@@ -3074,10 +3170,10 @@ internal class CrossfadeExoPlayerAdapter(
         private const val HPF_END_HZ = 20f // High-pass ends wide open
 
         // AutoMix constants
-        private const val AUTO_FALLBACK_DURATION_MS = 30000 // Default when no BPM data
+        private const val AUTO_FALLBACK_DURATION_MS = 24000 // Default when no BPM data
         private const val STRUCTURE_RETRY_MS = 30_000L
         private const val STRUCTURE_MAX_ATTEMPTS = 3
-        private const val AUTO_MIN_DURATION_MS = 20000
+        private const val AUTO_MIN_DURATION_MS = 15000
         private const val AUTO_MAX_DURATION_MS = 45000
         private val BEAT_COUNT_OPTIONS = intArrayOf(8, 16, 24, 32, 40, 48, 64, 80, 96)
         private const val DEFAULT_BEAT_COUNT = 32

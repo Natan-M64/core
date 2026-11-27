@@ -80,7 +80,7 @@ interface PlaylistRepository {
      */
     fun getYouTubeLibraryPlaylists(): Flow<YouTubeLibraryPlaylists>
 
-    fun getMixedForYou(): Flow<List<PlaylistsResult>?>
+    fun getMixedForYou(): Flow<Resource<List<PlaylistsResult>>>
 
     fun updateYourYouTubePlaylistTitle(
         playlistId: String,

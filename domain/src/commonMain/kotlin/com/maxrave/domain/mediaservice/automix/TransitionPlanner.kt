@@ -7,7 +7,10 @@ package com.maxrave.domain.mediaservice.automix
 data class TransitionPlan(
     /** The outgoing track's position when the blend starts. */
     val outgoingStartMs: Long,
-    /** The outgoing track's position when the blend ends: its last chorus's end, or its music's end. */
+    /**
+     * The outgoing track's position when the blend ends: its music's end, later only to spare the first
+     * half of its last drop, even past its last sound (the track then ends under the fade).
+     */
     val outgoingEndMs: Long,
     /** The fade's length: the adapters' own formula, shortened only by a late start. */
     val durationMs: Long,
@@ -44,13 +47,18 @@ object TransitionPlanner {
     private const val RAMP_PORTION = 0.6
 
     /**
-     * The fade ends where the outgoing song's last chorus ends, or where its music ends when loudness
-     * does not separate a chorus from an outro. The incoming track plays from where the end of its
-     * intro lands on that point; from 0 when its intro is shorter than the fade, or not told apart.
+     * The outgoing song is mixed out over its outro, as DJs do: the fade ends where its music ends. It
+     * never starts before the second half of the last drop (after the rest that splits it, or its
+     * middle when no rest was found), so the first half is always heard to its end; when the outro is
+     * too short to hold the fade, the fade starts there and keeps its length, the outgoing track ending
+     * under it (both adapters ignore its end of file while fading). Starting earlier so the fade ends on
+     * the last sound put it a second into the drop on songs that end on their drop. The incoming
+     * track plays from where the end of its intro lands on the fade's end; from 0 when its intro is
+     * shorter than the fade, or not told apart.
      *
      * @param durationMs the length the adapters' tempo/key formula gives this pair, used as is.
      * @param outgoingSpeedRatio the speed the outgoing track ramps to over the fade (1.0 = none).
-     * @return null when the outgoing song is too short to hold the fade before that end.
+     * @return null when the outgoing song is too short to hold the fade.
      */
     fun plan(
         outgoing: TrackStructure,
@@ -58,15 +66,19 @@ object TransitionPlanner {
         durationMs: Long,
         outgoingSpeedRatio: Float,
     ): TransitionPlan? {
-        val end = outgoing.lastChorusEndMs ?: outgoing.musicEndMs
         // The outgoing track covers more (or less) of its own timeline than the fade lasts, because
         // its speed ramps: smoothstep over RAMP_PORTION averages half way, then holds the target.
-        val outgoingAdvance = durationMs * (1 + (outgoingSpeedRatio - 1) * (1 - RAMP_PORTION / 2))
-        val start = (end - outgoingAdvance).toLong()
+        val outgoingAdvance = (durationMs * (1 + (outgoingSpeedRatio - 1) * (1 - RAMP_PORTION / 2))).toLong()
+        val secondHalf =
+            outgoing.lastDropSecondHalfMs
+                ?: outgoing.lastChorusStartMs?.let { dropStart ->
+                    dropStart + ((outgoing.lastChorusEndMs ?: outgoing.musicEndMs) - dropStart) / 2
+                }
+        val start = maxOf(outgoing.musicEndMs - outgoingAdvance, secondHalf ?: Long.MIN_VALUE)
         if (start <= outgoing.firstSoundMs) return null
         return TransitionPlan(
             outgoingStartMs = start,
-            outgoingEndMs = end,
+            outgoingEndMs = start + outgoingAdvance,
             durationMs = durationMs,
             incomingStartMs = incoming.introEndMs?.let { (it - durationMs).coerceAtLeast(0) } ?: 0L,
         )

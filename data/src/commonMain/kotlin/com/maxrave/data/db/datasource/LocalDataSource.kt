@@ -607,10 +607,10 @@ internal class LocalDataSource(
         offset,
     )
 
-    suspend fun getPlaylistPairSongByListPosition(
+    suspend fun getPlaylistPairSongByRowIds(
         playlistId: Long,
-        listPosition: List<Int>,
-    ) = databaseDao.getPlaylistPairSongByListPosition(playlistId, listPosition)
+        rowIds: List<Int>,
+    ) = databaseDao.getPlaylistPairSongByRowIds(playlistId, rowIds)
 
     /**
      * Search one local playlist by title or artist.
@@ -711,6 +711,27 @@ internal class LocalDataSource(
     ) {
         databaseDao.deletePairSongLocalPlaylist(playlistId, videoId)
         syncRecorder.playlistTrack(playlistId, videoId, inPlaylist = false)
+    }
+
+    /**
+     * Removes exactly the row [pairId]. Library sync tracks a song as in the playlist or not, so it
+     * hears the song left only once its last copy is gone; dropping one of several copies only
+     * moves the order.
+     *
+     * @return false when the row no longer exists.
+     */
+    suspend fun removePairSongFromLocalPlaylist(
+        playlistId: Long,
+        videoId: String,
+        pairId: Int,
+    ): Boolean {
+        val lastCopy = databaseDao.removePairSongFromLocalPlaylist(playlistId, videoId, pairId) ?: return false
+        if (lastCopy) {
+            syncRecorder.playlistTrack(playlistId, videoId, inPlaylist = false)
+        } else {
+            syncRecorder.playlistOrder(playlistId)
+        }
+        return true
     }
 
     suspend fun getGoogleAccounts() = databaseDao.getAllGoogleAccount()
